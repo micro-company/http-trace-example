@@ -31,4 +31,10 @@ curl -i http://localhost:8080/items/1     # should return 404
 
 # 7. Trigger an “invalid id” error (bad path parameter)
 curl -i http://localhost:8080/items/abc   # should return 400
+
+# explicit server failure
+curl -i http://localhost:8080/fail
+
+# panic captured by recoveryWithOtel
+curl -i http://localhost:8080/panic
 # -----------------------------------------------------------------------

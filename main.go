@@ -1,14 +1,20 @@
-// main.go — Gin + OpenTelemetry (OTLP/HTTP → Tempo) with slog logging
-// and a sync.Map-based in-memory store.
+// main.go — Gin CRUD demo with:
+//   • OpenTelemetry traces exported via OTLP/HTTP → Tempo
+//   • sync.Map store (thread-safe)
+//   • slog structured logging (trace-ID + status)
+//   • Spec-compliant error handling per
+//     https://opentelemetry.io/docs/specs/otel/error-handling/
 
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -36,7 +42,7 @@ type Item struct {
 
 var (
 	store sync.Map     // map[int]Item — thread-safe
-	idSeq atomic.Int64 // auto-incrementing ID
+	idSeq atomic.Int64 // monotonic ID
 )
 
 /* -------------------------------------------------------------------------- */
@@ -67,7 +73,7 @@ func initOpenTelemetry() func() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* slog middleware (status + trace ID)                                        */
+/* slog middleware (adds trace-ID + status)                                   */
 /* -------------------------------------------------------------------------- */
 
 func slogWithTrace(l *slog.Logger) gin.HandlerFunc {
@@ -85,7 +91,38 @@ func slogWithTrace(l *slog.Logger) gin.HandlerFunc {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Main & routes                                                              */
+/* Recovery middleware → spec-compliant panic handling                        */
+/* -------------------------------------------------------------------------- */
+
+func recoveryWithOtel(l *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				err := fmt.Errorf("panic: %v", rec)
+
+				span := traceSpan(c.Request.Context())
+				span.RecordError(err,
+					trace.WithStackTrace(true),
+					trace.WithAttributes(
+						attribute.Bool("exception.escaped", true),
+						attribute.String("exception.stacktrace", string(debug.Stack())),
+					),
+				)
+				span.SetStatus(codes.Error, "panic")
+
+				l.Error("panic recovered",
+					"error", err,
+					"trace_id", span.SpanContext().TraceID().String(),
+				)
+				c.AbortWithStatus(http.StatusInternalServerError)
+			}
+		}()
+		c.Next()
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 
 func main() {
@@ -94,15 +131,25 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	r := gin.New()
+	r := gin.New() // no default logger/recovery
 	r.Use(otelgin.Middleware("otel-crud-example"))
+	r.Use(recoveryWithOtel(logger))
 	r.Use(slogWithTrace(logger))
 
+	// CRUD routes
 	r.POST("/items", createItem)
 	r.GET("/items", listItems)
 	r.GET("/items/:id", getItem)
 	r.PUT("/items/:id", updateItem)
 	r.DELETE("/items/:id", deleteItem)
+
+	/* 500-error demos */
+	r.GET("/fail", func(c *gin.Context) {
+		respondError(c, errors.New("simulated server failure"), http.StatusInternalServerError)
+	})
+	r.GET("/panic", func(_ *gin.Context) {
+		panic("simulated panic")
+	})
 
 	logger.Info("Listening on :8080 …")
 	if err := r.Run(":8080"); err != nil {
@@ -190,13 +237,19 @@ func deleteItem(c *gin.Context) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Error helper                                                               */
+/* Error helper (spec-compliant)                                              */
 /* -------------------------------------------------------------------------- */
 
 func respondError(c *gin.Context, err error, status int) {
 	span := traceSpan(c.Request.Context())
-	span.RecordError(err, trace.WithAttributes(attribute.String("http.status_text", http.StatusText(status))))
-	span.SetStatus(codes.Error, err.Error())
+
+	// always record the error event
+	span.RecordError(err)
+
+	// mark span failed only for 5xx (server-side) errors
+	if status >= 500 {
+		span.SetStatus(codes.Error, err.Error())
+	}
 
 	c.JSON(status, gin.H{"error": err.Error()})
 }
