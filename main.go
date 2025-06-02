@@ -1,9 +1,9 @@
 // main.go — Gin CRUD demo with:
-//   • OpenTelemetry traces exported via OTLP/HTTP → Tempo
-//   • sync.Map store (thread-safe)
-//   • slog structured logging (trace-ID + status)
-//   • Spec-compliant error handling per
-//     https://opentelemetry.io/docs/specs/otel/error-handling/
+//   • OTLP/HTTP spans → Tempo
+//   • sync.Map store
+//   • slog structured logs (trace_id + span_id)
+//   • Spec-compliant error handling
+//   • /fail  &  /panic endpoints to generate 5xx traces
 
 package main
 
@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -41,8 +42,8 @@ type Item struct {
 }
 
 var (
-	store sync.Map     // map[int]Item — thread-safe
-	idSeq atomic.Int64 // monotonic ID
+	store sync.Map
+	idSeq atomic.Int64
 )
 
 /* -------------------------------------------------------------------------- */
@@ -53,11 +54,13 @@ func initOpenTelemetry() func() {
 	ctx := context.Background()
 
 	exp, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithEndpoint(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")), // e.g. "tempo:4318"
+		otlptracehttp.WithEndpoint(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")), // e.g. "collector:4318"
 		otlptracehttp.WithInsecure(),
+		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: true}),
+		otlptracehttp.WithTimeout(5*time.Second),
 	)
 	if err != nil {
-		panic("failed to create OTLP-HTTP exporter: " + err.Error())
+		panic("failed to create OTLP exporter: " + err.Error())
 	}
 
 	tp := sdktrace.NewTracerProvider(
@@ -73,7 +76,7 @@ func initOpenTelemetry() func() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* slog middleware (adds trace-ID + status)                                   */
+/* slog middleware — adds trace_id + span_id                                  */
 /* -------------------------------------------------------------------------- */
 
 func slogWithTrace(l *slog.Logger) gin.HandlerFunc {
@@ -81,17 +84,20 @@ func slogWithTrace(l *slog.Logger) gin.HandlerFunc {
 		c.Next()
 
 		span := trace.SpanFromContext(c.Request.Context())
+		sc := span.SpanContext()
+
 		l.Info("request",
 			"method", c.Request.Method,
 			"path", c.FullPath(),
 			"status", c.Writer.Status(),
-			"trace_id", span.SpanContext().TraceID().String(),
+			"trace_id", sc.TraceID().String(),
+			"span_id", sc.SpanID().String(),
 		)
 	}
 }
 
 /* -------------------------------------------------------------------------- */
-/* Recovery middleware → spec-compliant panic handling                        */
+/* Recovery middleware — spec-compliant panic capture                         */
 /* -------------------------------------------------------------------------- */
 
 func recoveryWithOtel(l *slog.Logger) gin.HandlerFunc {
@@ -102,17 +108,20 @@ func recoveryWithOtel(l *slog.Logger) gin.HandlerFunc {
 
 				span := traceSpan(c.Request.Context())
 				span.RecordError(err,
-					trace.WithStackTrace(true),
 					trace.WithAttributes(
 						attribute.Bool("exception.escaped", true),
+						attribute.String("exception.type", fmt.Sprintf("%T", rec)),
+						attribute.String("exception.message", fmt.Sprint(rec)),
 						attribute.String("exception.stacktrace", string(debug.Stack())),
 					),
+					trace.WithStackTrace(true),
 				)
 				span.SetStatus(codes.Error, "panic")
 
 				l.Error("panic recovered",
 					"error", err,
 					"trace_id", span.SpanContext().TraceID().String(),
+					"span_id", span.SpanContext().SpanID().String(),
 				)
 				c.AbortWithStatus(http.StatusInternalServerError)
 			}
@@ -129,21 +138,21 @@ func main() {
 	shutdown := initOpenTelemetry()
 	defer shutdown()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{AddSource: true}))
 
-	r := gin.New() // no default logger/recovery
+	r := gin.New()
 	r.Use(otelgin.Middleware("otel-crud-example"))
 	r.Use(recoveryWithOtel(logger))
 	r.Use(slogWithTrace(logger))
 
-	// CRUD routes
+	/* CRUD */
 	r.POST("/items", createItem)
 	r.GET("/items", listItems)
 	r.GET("/items/:id", getItem)
 	r.PUT("/items/:id", updateItem)
 	r.DELETE("/items/:id", deleteItem)
 
-	/* 500-error demos */
+	/* 5xx examples */
 	r.GET("/fail", func(c *gin.Context) {
 		respondError(c, errors.New("simulated server failure"), http.StatusInternalServerError)
 	})
