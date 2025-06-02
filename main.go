@@ -1,16 +1,17 @@
-// main.go — Gin version with OpenTelemetry (OTLP/HTTP → Tempo) and
-// structured logs that include the trace ID and HTTP status.
+// main.go — Gin + OpenTelemetry (OTLP/HTTP → Tempo) with slog logging
+// and a sync.Map-based in-memory store.
 
 package main
 
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -34,9 +35,8 @@ type Item struct {
 }
 
 var (
-	store   = make(map[int]Item)
-	idSeq   = 0
-	storeMu sync.RWMutex
+	store sync.Map     // map[int]Item — thread-safe
+	idSeq atomic.Int64 // auto-incrementing ID
 )
 
 /* -------------------------------------------------------------------------- */
@@ -67,18 +67,20 @@ func initOpenTelemetry() func() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Logging middleware (status + trace ID)                                     */
+/* slog middleware (status + trace ID)                                        */
 /* -------------------------------------------------------------------------- */
 
-func logWithTrace() gin.HandlerFunc {
+func slogWithTrace(l *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Next() // run handler chain
+		c.Next()
 
 		span := trace.SpanFromContext(c.Request.Context())
-		traceID := span.SpanContext().TraceID().String()
-
-		log.Printf("method=%s path=%s status=%d trace_id=%s",
-			c.Request.Method, c.FullPath(), c.Writer.Status(), traceID)
+		l.Info("request",
+			"method", c.Request.Method,
+			"path", c.FullPath(),
+			"status", c.Writer.Status(),
+			"trace_id", span.SpanContext().TraceID().String(),
+		)
 	}
 }
 
@@ -90,20 +92,21 @@ func main() {
 	shutdown := initOpenTelemetry()
 	defer shutdown()
 
-	r := gin.New()
-	r.Use(otelgin.Middleware("otel-crud-example")) // creates spans
-	r.Use(logWithTrace())                          // logs with trace IDs
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	// CRUD routes
+	r := gin.New()
+	r.Use(otelgin.Middleware("otel-crud-example"))
+	r.Use(slogWithTrace(logger))
+
 	r.POST("/items", createItem)
 	r.GET("/items", listItems)
 	r.GET("/items/:id", getItem)
 	r.PUT("/items/:id", updateItem)
 	r.DELETE("/items/:id", deleteItem)
 
-	log.Println("Listening on :8080 …")
+	logger.Info("Listening on :8080 …")
 	if err := r.Run(":8080"); err != nil {
-		log.Fatalf("server error: %v", err)
+		logger.Error("server error", "err", err)
 	}
 }
 
@@ -118,23 +121,19 @@ func createItem(c *gin.Context) {
 		return
 	}
 
-	storeMu.Lock()
-	idSeq++
-	item := Item{ID: idSeq, Name: in.Name}
-	store[item.ID] = item
-	storeMu.Unlock()
+	id := int(idSeq.Add(1))
+	item := Item{ID: id, Name: in.Name}
+	store.Store(id, item)
 
 	c.JSON(http.StatusCreated, item)
 }
 
 func listItems(c *gin.Context) {
-	storeMu.RLock()
-	items := make([]Item, 0, len(store))
-	for _, it := range store {
-		items = append(items, it)
-	}
-	storeMu.RUnlock()
-
+	items := make([]Item, 0)
+	store.Range(func(_, v any) bool {
+		items = append(items, v.(Item))
+		return true
+	})
 	c.JSON(http.StatusOK, items)
 }
 
@@ -144,15 +143,12 @@ func getItem(c *gin.Context) {
 		respondError(c, err, http.StatusBadRequest)
 		return
 	}
-
-	storeMu.RLock()
-	item, ok := store[id]
-	storeMu.RUnlock()
+	val, ok := store.Load(id)
 	if !ok {
 		respondError(c, errors.New("not found"), http.StatusNotFound)
 		return
 	}
-	c.JSON(http.StatusOK, item)
+	c.JSON(http.StatusOK, val.(Item))
 }
 
 func updateItem(c *gin.Context) {
@@ -161,14 +157,12 @@ func updateItem(c *gin.Context) {
 		respondError(c, err, http.StatusBadRequest)
 		return
 	}
-
-	storeMu.Lock()
-	item, ok := store[id]
-	storeMu.Unlock()
+	val, ok := store.Load(id)
 	if !ok {
 		respondError(c, errors.New("not found"), http.StatusNotFound)
 		return
 	}
+	item := val.(Item)
 
 	var in struct{ Name string }
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -177,10 +171,7 @@ func updateItem(c *gin.Context) {
 	}
 
 	item.Name = in.Name
-	storeMu.Lock()
-	store[id] = item
-	storeMu.Unlock()
-
+	store.Store(id, item)
 	c.JSON(http.StatusOK, item)
 }
 
@@ -190,18 +181,11 @@ func deleteItem(c *gin.Context) {
 		respondError(c, err, http.StatusBadRequest)
 		return
 	}
-
-	storeMu.Lock()
-	_, ok := store[id]
-	if ok {
-		delete(store, id)
-	}
-	storeMu.Unlock()
-
-	if !ok {
+	if _, ok := store.Load(id); !ok {
 		respondError(c, errors.New("not found"), http.StatusNotFound)
 		return
 	}
+	store.Delete(id)
 	c.Status(http.StatusNoContent)
 }
 
