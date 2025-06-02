@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - uid: tempo
+    name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    jsonData:
+      httpMethod: GET          # use GET for large payloads in Explore
+      serviceMap:
+        datasourceUid: tempo   # enable service map view
+      tracesToLogsV2:
+        datasourceUid: tempo   # (optional) link traces → logs
+      tracesToMetrics:
+        datasourceUid: tempo   # (optional) link traces → metrics
