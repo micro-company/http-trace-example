@@ -1,17 +1,19 @@
+// main.go — Gin version with OpenTelemetry (OTLP/HTTP → Tempo) and
+// structured logs that include the trace ID and HTTP status.
+
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"sync"
 
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -44,7 +46,7 @@ var (
 func initOpenTelemetry() func() {
 	ctx := context.Background()
 
-	httpExp, err := otlptracehttp.New(ctx,
+	exp, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpoint(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")), // e.g. "tempo:4318"
 		otlptracehttp.WithInsecure(),
 	)
@@ -53,7 +55,7 @@ func initOpenTelemetry() func() {
 	}
 
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(httpExp),
+		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String("otel-crud-example"),
@@ -65,34 +67,19 @@ func initOpenTelemetry() func() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Logging middleware (adds traceID + status)                                 */
+/* Logging middleware (status + trace ID)                                     */
 /* -------------------------------------------------------------------------- */
 
-// statusRecorder captures the status code written by the handler.
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
+func logWithTrace() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next() // run handler chain
 
-func (sr *statusRecorder) WriteHeader(code int) {
-	sr.status = code
-	sr.ResponseWriter.WriteHeader(code)
-}
-
-// loggingMiddleware logs method, path, status, and traceID for each request.
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-
-		// Serve the request (otelhttp creates the span inside).
-		next.ServeHTTP(sr, r)
-
-		span := trace.SpanFromContext(r.Context())
+		span := trace.SpanFromContext(c.Request.Context())
 		traceID := span.SpanContext().TraceID().String()
 
 		log.Printf("method=%s path=%s status=%d trace_id=%s",
-			r.Method, r.URL.Path, sr.status, traceID)
-	})
+			c.Request.Method, c.FullPath(), c.Writer.Status(), traceID)
+	}
 }
 
 /* -------------------------------------------------------------------------- */
@@ -103,70 +90,31 @@ func main() {
 	shutdown := initOpenTelemetry()
 	defer shutdown()
 
-	mux := http.NewServeMux()
-	mux.Handle("/items",
-		otelhttp.NewHandler(
-			loggingMiddleware(http.HandlerFunc(itemsHandler)),
-			"itemsCollection",
-		),
-	)
-	mux.Handle("/items/",
-		otelhttp.NewHandler(
-			loggingMiddleware(http.HandlerFunc(itemHandler)),
-			"singleItem",
-		),
-	)
+	r := gin.New()
+	r.Use(otelgin.Middleware("otel-crud-example")) // creates spans
+	r.Use(logWithTrace())                          // logs with trace IDs
+
+	// CRUD routes
+	r.POST("/items", createItem)
+	r.GET("/items", listItems)
+	r.GET("/items/:id", getItem)
+	r.PUT("/items/:id", updateItem)
+	r.DELETE("/items/:id", deleteItem)
 
 	log.Println("Listening on :8080 …")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	if err := r.Run(":8080"); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
 /* -------------------------------------------------------------------------- */
-/* Handlers                                                                   */
+/* CRUD handlers                                                              */
 /* -------------------------------------------------------------------------- */
 
-func itemsHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodPost:
-		createItem(w, r)
-	case http.MethodGet:
-		listItems(w, r)
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func itemHandler(w http.ResponseWriter, r *http.Request) {
-	idStr := r.URL.Path[len("/items/"):]
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		respondError(r.Context(), w, fmt.Errorf("invalid id: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		getItem(r.Context(), w, id)
-	case http.MethodPut:
-		updateItem(r.Context(), w, r, id)
-	case http.MethodDelete:
-		deleteItem(r.Context(), w, id)
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-/* -------------------------------------------------------------------------- */
-/* CRUD helpers                                                               */
-/* -------------------------------------------------------------------------- */
-
-func createItem(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+func createItem(c *gin.Context) {
 	var in struct{ Name string }
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		respondError(ctx, w, err, http.StatusBadRequest)
+	if err := c.ShouldBindJSON(&in); err != nil {
+		respondError(c, err, http.StatusBadRequest)
 		return
 	}
 
@@ -176,12 +124,10 @@ func createItem(w http.ResponseWriter, r *http.Request) {
 	store[item.ID] = item
 	storeMu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(item)
+	c.JSON(http.StatusCreated, item)
 }
 
-func listItems(w http.ResponseWriter, r *http.Request) {
+func listItems(c *gin.Context) {
 	storeMu.RLock()
 	items := make([]Item, 0, len(store))
 	for _, it := range store {
@@ -189,34 +135,44 @@ func listItems(w http.ResponseWriter, r *http.Request) {
 	}
 	storeMu.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(items)
+	c.JSON(http.StatusOK, items)
 }
 
-func getItem(ctx context.Context, w http.ResponseWriter, id int) {
+func getItem(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		respondError(c, err, http.StatusBadRequest)
+		return
+	}
+
 	storeMu.RLock()
 	item, ok := store[id]
 	storeMu.RUnlock()
 	if !ok {
-		respondError(ctx, w, errors.New("not found"), http.StatusNotFound)
+		respondError(c, errors.New("not found"), http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(item)
+	c.JSON(http.StatusOK, item)
 }
 
-func updateItem(ctx context.Context, w http.ResponseWriter, r *http.Request, id int) {
+func updateItem(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		respondError(c, err, http.StatusBadRequest)
+		return
+	}
+
 	storeMu.Lock()
 	item, ok := store[id]
 	storeMu.Unlock()
 	if !ok {
-		respondError(ctx, w, errors.New("not found"), http.StatusNotFound)
+		respondError(c, errors.New("not found"), http.StatusNotFound)
 		return
 	}
 
 	var in struct{ Name string }
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		respondError(ctx, w, err, http.StatusBadRequest)
+	if err := c.ShouldBindJSON(&in); err != nil {
+		respondError(c, err, http.StatusBadRequest)
 		return
 	}
 
@@ -225,11 +181,16 @@ func updateItem(ctx context.Context, w http.ResponseWriter, r *http.Request, id 
 	store[id] = item
 	storeMu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(item)
+	c.JSON(http.StatusOK, item)
 }
 
-func deleteItem(ctx context.Context, w http.ResponseWriter, id int) {
+func deleteItem(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		respondError(c, err, http.StatusBadRequest)
+		return
+	}
+
 	storeMu.Lock()
 	_, ok := store[id]
 	if ok {
@@ -238,22 +199,22 @@ func deleteItem(ctx context.Context, w http.ResponseWriter, id int) {
 	storeMu.Unlock()
 
 	if !ok {
-		respondError(ctx, w, errors.New("not found"), http.StatusNotFound)
+		respondError(c, errors.New("not found"), http.StatusNotFound)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	c.Status(http.StatusNoContent)
 }
 
 /* -------------------------------------------------------------------------- */
 /* Error helper                                                               */
 /* -------------------------------------------------------------------------- */
 
-func respondError(ctx context.Context, w http.ResponseWriter, err error, status int) {
-	span := traceSpan(ctx)
+func respondError(c *gin.Context, err error, status int) {
+	span := traceSpan(c.Request.Context())
 	span.RecordError(err, trace.WithAttributes(attribute.String("http.status_text", http.StatusText(status))))
 	span.SetStatus(codes.Error, err.Error())
 
-	http.Error(w, err.Error(), status)
+	c.JSON(status, gin.H{"error": err.Error()})
 }
 
 /* -------------------------------------------------------------------------- */
